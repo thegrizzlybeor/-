@@ -31,6 +31,10 @@ UNKNOWN = int(float(os.getenv("UNKNOWN_ITEM_MB", "150")) * MB)
 MAX_JOBS = 256          # GitHub matrix limit
 MAX_ASSETS = 800        # a release holds at most 1000 files
 RUN = os.getenv("GITHUB_RUN_NUMBER", "0")
+IMG_X = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".avif", ".heic"}
+VID_X = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv", ".ts", ".wmv", ".3gp"}
+AUD_X = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".wma"}
+TITLE_KEYS = ("album_name", "album_title", "title", "album", "gallery", "folder", "name", "subcategory_name")
 DIRECT_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".avif", ".heic",
               ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv", ".ts", ".wmv", ".3gp",
               ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".wma"}
@@ -61,7 +65,7 @@ def target_of(url):
 
 
 def list_items(url):
-    """Returns a list of item sizes in bytes (0 = unknown), or None if listing failed."""
+    """Returns {"sizes": [...], "kinds": [...], "title": str} (size 0 = unknown), or None if listing failed."""
     cmd = ["gallery-dl", "-J", "--retries", "4"]
     if Path("cookies.txt").exists():
         cmd += ["--cookies", "cookies.txt"]
@@ -72,18 +76,43 @@ def list_items(url):
     except Exception as e:
         print(f"::warning::could not list {url} ({e.__class__.__name__}); it will run as one job")
         return None
-    sizes = []
+    sizes, kinds, title = [], [], ""
     for m in data:
-        if isinstance(m, list) and m and m[0] == 3:  # 3 = file URL message
-            meta = m[2] if len(m) > 2 and isinstance(m[2], dict) else {}
+        if not (isinstance(m, list) and m):
+            continue
+        meta = next((x for x in m[1:] if isinstance(x, dict)), {})
+        if not title:  # album name lives in the directory / file metadata
+            for key in TITLE_KEYS:
+                v = meta.get(key)
+                if isinstance(v, str) and v.strip():
+                    title = v.strip()
+                    break
+        if m[0] == 3:  # 3 = file URL message
             size = 0
             for key in ("size", "filesize", "file_size", "bytes"):
                 v = meta.get(key)
                 if isinstance(v, (int, float)) and v > 0:
                     size = int(v)
                     break
+            ext = "." + str(meta.get("extension") or "").lower().lstrip(".")
+            if ext == ".":
+                ext = Path(urlparse(str(m[1])).path).suffix.lower()
+            kinds.append("IMG" if ext in IMG_X else "VID" if ext in VID_X
+                         else "AUD" if ext in AUD_X else "FILE")
             sizes.append(size)
-    return sizes or None
+    if not sizes:
+        return None
+    if not title:
+        title = Path(urlparse(url).path).name or urlparse(url).netloc
+    return {"sizes": sizes, "kinds": kinds, "title": re.sub(r"\s+", " ", title)}
+
+
+def label_of(info):
+    """IMG / VID / AUD / FILE: what most of the album is (by bytes, else by count)."""
+    weight = {}
+    for size, k in zip(info["sizes"], info["kinds"]):
+        weight[k] = weight.get(k, 0) + (size or UNKNOWN)
+    return max(weight, key=weight.get)
 
 
 def chunk(sizes, cap, max_items):
@@ -105,8 +134,8 @@ def plan(links, listed):
     while True:
         per_link = {}
         for idx, url in enumerate(links, 1):
-            sizes = listed.get(url)
-            per_link[idx] = chunk(sizes, cap, max_items) if sizes else None
+            info = listed.get(url)
+            per_link[idx] = chunk(info["sizes"], cap, max_items) if info else None
         total = sum(len(c) if c else 1 for c in per_link.values())
         if total <= MAX_JOBS or cap > 40 * GB:
             return per_link, cap
@@ -124,15 +153,18 @@ def main():
     if cap != CHUNK_BYTES:
         print(f"::notice::many files -> chunk size raised to {cap / GB:.0f} GB to stay under {MAX_JOBS} jobs")
 
-    include, rows, tags = [], [], []
+    include, rows, tags = [], [], {}   # tags: release tag -> release title
     for idx, url in enumerate(links, 1):
-        sizes, chunks = listed[url], per_link[idx]
+        chunks = per_link[idx]
         if not chunks:  # listing failed / empty -> one plain job, fetch.py reports what happens
             include.append({"job": f"{idx}", "idx": idx, "part": "", "range": "", "url": url,
                             "tag": f"run-{RUN}-{idx}"})
-            rows.append((idx, url, "?", "?", 1))
-            tags.append(f"run-{RUN}-{idx}")
+            rows.append((idx, f"FILE | {Path(urlparse(url).path).name or url}", url, "?", "?", 1))
+            tags[f"run-{RUN}-{idx}"] = f"FILE | {Path(urlparse(url).path).name or url}"[:100]
             continue
+        info = listed[url]
+        sizes = info["sizes"]
+        title = f"{label_of(info)} | {info['title']}"
         per_chunk_tag = len(sizes) > MAX_ASSETS
         for k, (a, b) in enumerate(chunks, 1):
             part = f"p{k:02d}" if len(chunks) > 1 else ""
@@ -141,11 +173,11 @@ def main():
             include.append({"job": f"{idx}-{part}" if part else f"{idx}", "idx": idx,
                             "part": part, "range": rng, "url": url, "tag": tag})
             if tag not in tags:
-                tags.append(tag)
+                tags[tag] = (f"{title} (part {k}/{len(chunks)})" if per_chunk_tag else title)[:100]
         known = sum(sizes)
         unknown = sum(1 for s in sizes if not s)
         est = f"{known / GB:.1f} GB" + (f" + {unknown} unknown" if unknown else "")
-        rows.append((idx, url, len(sizes), est, len(chunks)))
+        rows.append((idx, title, url, len(sizes), est, len(chunks)))
 
     if len(include) > MAX_JOBS:
         print(f"::warning::{len(include)} jobs, GitHub allows {MAX_JOBS}; using the first {MAX_JOBS}")
@@ -153,15 +185,15 @@ def main():
 
     if os.getenv("CREATE_RELEASES") == "1":
         repo, sha = os.environ["GITHUB_REPOSITORY"], os.getenv("GITHUB_SHA", "")
-        for tag in tags:
-            cmd = ["gh", "release", "create", tag, "--repo", repo, "--title", f"Batch {tag}",
+        for tag, rel_title in tags.items():
+            cmd = ["gh", "release", "create", tag, "--repo", repo, "--title", rel_title,
                    "--notes", f"Files from workflow run {RUN}"]
             if sha:
                 cmd += ["--target", sha]
             subprocess.run(cmd, capture_output=True, text=True)
 
-    summary = ["## Plan", "| # | Link | Files | Size | Jobs |", "|---|---|---|---|---|"]
-    summary += [f"| {i} | {u} | {n} | {s} | {j} |" for i, u, n, s, j in rows]
+    summary = ["## Plan", "| # | Release | Link | Files | Size | Jobs |", "|---|---|---|---|---|---|"]
+    summary += [f"| {i} | {t.replace('|', chr(92) + '|')} | {u} | {n} | {s} | {j} |" for i, t, u, n, s, j in rows]
     text = "\n".join(summary)
     print(text)
     if os.getenv("GITHUB_STEP_SUMMARY"):

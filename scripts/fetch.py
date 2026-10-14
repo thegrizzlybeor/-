@@ -13,7 +13,7 @@ Tuning is done with environment variables (all optional):
   VIDEO_CODEC=h265     h265 (smaller) or h264 (plays everywhere)
   IMAGE_QUALITY=82     WebP quality
   IMAGE_MAX_SIDE=3000  images larger than this are scaled down
-  BUNDLE_IMAGES_OVER=5 more than this many images -> packed into images.zip
+  BUNDLE_IMAGES_OVER=0 more than this many images -> packed into images.zip (0 = always)
   COOKIES              contents of a Netscape cookies.txt (optional)
 """
 import hashlib
@@ -38,7 +38,7 @@ MAX_H = int(os.getenv("MAX_HEIGHT", "720"))
 CODEC = os.getenv("VIDEO_CODEC", "h265").lower()
 IMG_Q = int(os.getenv("IMAGE_QUALITY", "82"))
 IMG_SIDE = int(os.getenv("IMAGE_MAX_SIDE", "3000"))
-BUNDLE_OVER = int(os.getenv("BUNDLE_IMAGES_OVER", "5"))
+BUNDLE_OVER = int(os.getenv("BUNDLE_IMAGES_OVER", "0"))   # 0 = images are ALWAYS zipped
 
 IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".avif", ".heic"}
 VID_EXT = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv", ".ts", ".wmv", ".3gp"}

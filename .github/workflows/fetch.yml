@@ -22,6 +22,11 @@ on:
         type: choice
         options: ["release", "data-branch"]
         default: "release"
+      chunk_gb:
+        description: "Big albums are split into jobs of about this many GB each (each job = its own runner)"
+        type: choice
+        options: ["4", "8", "12"]
+        default: "8"
       append:
         description: "Keep previous batches (old releases / data-branch history). Off = replace them."
         type: boolean
@@ -36,66 +41,52 @@ jobs:
     outputs:
       matrix: ${{ steps.m.outputs.matrix }}
       count: ${{ steps.m.outputs.count }}
-      tag: ${{ steps.rel.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
-      - id: rel
-        if: inputs.storage != 'data-branch'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Remove previous release batches
+        if: inputs.storage != 'data-branch' && inputs.append != true
         env:
           GH_TOKEN: ${{ github.token }}
-          APPEND: ${{ inputs.append }}
         run: |
-          set -euo pipefail
-          TAG="run-${GITHUB_RUN_NUMBER}"
-          if [ "$APPEND" != "true" ]; then
-            gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName -q '.[].tagName' \
-              | { grep '^run-' || true; } \
-              | xargs -r -n1 gh release delete --repo "$GITHUB_REPOSITORY" --cleanup-tag -y
-          fi
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "Batch $TAG" --notes "Files from workflow run ${GITHUB_RUN_NUMBER}" || true
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-      - id: m
+          set -uo pipefail
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName -q '.[].tagName' \
+            | { grep '^run-' || true; } \
+            | xargs -r -n1 gh release delete --repo "$GITHUB_REPOSITORY" --cleanup-tag -y
+
+      - name: Plan jobs (list every link, split big albums)
+        id: m
         env:
+          GH_TOKEN: ${{ github.token }}
           INPUT_LINKS: ${{ inputs.links }}
+          COOKIES: ${{ secrets.COOKIES }}
+          CHUNK_GB: ${{ inputs.chunk_gb }}
+          CREATE_RELEASES: ${{ inputs.storage != 'data-branch' && '1' || '0' }}
         run: |
-          python3 - <<'PY'
-          import json, os, re
-          raw = os.environ.get("INPUT_LINKS", "").strip()
-          if not raw:
-              lines = []
-              for line in open("links.txt", encoding="utf-8"):
-                  line = line.split(" #")[0].strip()
-                  if line and not line.startswith("#"):
-                      lines.append(line)
-              raw = "\n".join(lines)
-          links = []
-          for tok in re.split(r"\s+", raw):
-              for u in re.split(r",(?=https?://)", tok):
-                  u = u.strip().strip(",")
-                  if u and u not in links:
-                      links.append(u)
-          if len(links) > 256:
-              print("::warning::GitHub allows 256 matrix jobs, using the first 256")
-              links = links[:256]
-          matrix = {"include": [{"idx": i, "url": u} for i, u in enumerate(links, 1)]}
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"matrix={json.dumps(matrix)}\n")
-              f.write(f"count={len(links)}\n")
-          print(f"{len(links)} link(s) queued")
-          PY
+          pip install -q -U gallery-dl
+          python3 scripts/expand.py
 
   fetch:
     needs: prepare
     if: needs.prepare.outputs.count != '0'
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 350
     strategy:
       fail-fast: false
       max-parallel: 20
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Free disk space (big albums need room)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h / | tail -1
 
       - uses: actions/setup-python@v5
         with:
@@ -111,17 +102,19 @@ jobs:
         env:
           URL: ${{ matrix.url }}
           IDX: ${{ matrix.idx }}
+          RANGE: ${{ matrix.range }}
+          PART: ${{ matrix.part }}
           MAX_HEIGHT: ${{ inputs.max_height }}
           VIDEO_CODEC: ${{ inputs.video_codec }}
           MAX_MB: ${{ inputs.storage == 'data-branch' && '90' || '1900' }}
           COOKIES: ${{ secrets.COOKIES }}
-        run: python scripts/fetch.py "$URL" "$IDX"
+        run: python scripts/fetch.py "$URL" "$IDX" "$RANGE" "$PART"
 
       - name: Upload to release (up to 2 GB per file)
         if: always() && inputs.storage != 'data-branch'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.prepare.outputs.tag }}
+          TAG: ${{ matrix.tag }}
         run: |
           set -uo pipefail
           [ -d out ] || exit 0
@@ -146,7 +139,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always() && inputs.storage == 'data-branch'
         with:
-          name: out-${{ matrix.idx }}
+          name: out-${{ matrix.job }}
           path: out
           retention-days: 3
           if-no-files-found: ignore

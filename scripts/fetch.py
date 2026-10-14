@@ -16,6 +16,7 @@ Tuning is done with environment variables (all optional):
   BUNDLE_IMAGES_OVER=5 more than this many images -> packed into images.zip
   COOKIES              contents of a Netscape cookies.txt (optional)
 """
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,8 @@ from urllib.parse import urlparse
 
 URL = sys.argv[1].strip()
 IDX = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+RANGE = sys.argv[3].strip() if len(sys.argv) > 3 else ""   # gallery-dl --range slice of an album
+PART = sys.argv[4].strip() if len(sys.argv) > 4 else ""    # p01, p02 ... for big albums
 
 MB = 1024 * 1024
 MAX_BYTES = int(float(os.getenv("MAX_MB", "90")) * MB)
@@ -48,7 +51,7 @@ def slugify(s, n=60):
 
 
 _u = urlparse(URL)
-NAME = f"{IDX:02d}-{slugify(_u.netloc + _u.path, 50)}"
+NAME = "-".join(x for x in (f"{IDX:02d}", PART, slugify(_u.netloc + _u.path, 50)) if x)
 WORK = Path("work") / NAME
 OUT = Path("out") / NAME
 IMGDIR = WORK / "img"
@@ -127,6 +130,8 @@ def download() -> Path:
     g = ["gallery-dl", "-d", dl, "--retries", "6", "--sleep-request", "0.5-1.5"]
     if COOKIES.exists():
         g += ["--cookies", COOKIES]
+    if RANGE:
+        g += ["--range", RANGE]
     rc, out = run(g + [target])
     log(out.strip()[-1200:])
     LOG_TAIL.append(out.strip()[-600:])
@@ -136,44 +141,88 @@ def download() -> Path:
 # --------------------------------------------------------------------------
 # 2. COMPRESS
 # --------------------------------------------------------------------------
-def kind(p: Path) -> str:
-    e = p.suffix.lower()
-    if e in IMG_EXT:
+def sniff(p: Path) -> str:
+    """Identify a file by its first bytes, not its name. '' = unknown."""
+    try:
+        with open(p, "rb") as f:
+            head = f.read(64)
+        size = p.stat().st_size
+    except OSError:
+        return ""
+    if (head.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a"))
+            or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
+            or (head[:2] == b"BM" and head[6:10] == b"\0\0\0\0")
+            or head[:4] in (b"II*\x00", b"MM\x00*")
+            or (head[4:8] == b"ftyp" and head[8:12] in (b"heic", b"heix", b"heim", b"mif1", b"msf1", b"avif"))):
         return "image"
+    if size < 512 * 1024 and head.lstrip().lower().startswith((b"<!doctype html", b"<html", b"<?xml")):
+        return "junk"   # an error page saved under a media name
+    return ""
+
+
+def kind(p: Path) -> str:
+    s = sniff(p)
+    if s:
+        return s
+    e = p.suffix.lower()
+    streams = probe(p).get("streams", [])          # what is REALLY inside
+    still = {"mjpeg", "png", "bmp", "webp", "tiff", "gif", "jpeg2000", "heic", "avif"}
+    vids = [x for x in streams if x.get("codec_type") == "video"]
+    if vids and not all(x.get("codec_name") in still for x in vids):
+        return "video"
+    if e in IMG_EXT or vids:
+        return "image"
+    if any(x.get("codec_type") == "audio" for x in streams):
+        return "audio"
     if e in VID_EXT:
         return "video"
     if e in AUD_EXT:
         return "audio"
-    types = {s.get("codec_type") for s in probe(p).get("streams", [])}  # sniff unknown
-    if "video" in types:
-        return "video"
-    if "audio" in types:
-        return "audio"
     return "other"
+
+
+def fingerprint(p: Path):
+    """size + hash of head and tail: cheap duplicate detection even for huge files."""
+    h, size = hashlib.sha1(), p.stat().st_size
+    with open(p, "rb") as f:
+        h.update(f.read(4 * MB))
+        if size > 8 * MB:
+            f.seek(-4 * MB, 2)
+            h.update(f.read(4 * MB))
+    return size, h.hexdigest()
 
 
 def split_file(path: Path, dest_dir: Path):
     """Raw split for files that can't be re-encoded. Rejoin: cat name.part* > name"""
-    outs = []
+    outs, block = [], 64 * MB
     with open(path, "rb") as f:
         i = 1
         while True:
-            chunk = f.read(MAX_BYTES)
-            if not chunk:
-                break
             part = dest_dir / f"{path.name}.part{i:03d}"
-            part.write_bytes(chunk)
+            written = 0
+            with open(part, "wb") as o:
+                while written < MAX_BYTES:
+                    data = f.read(min(block, MAX_BYTES - written))
+                    if not data:
+                        break
+                    o.write(data)
+                    written += len(data)
+            if written == 0:
+                part.unlink()
+                break
             outs.append(part)
             i += 1
     return outs
 
 
 def keep_as_is(src: Path):
-    dst = unique(OUT / src.name)
-    shutil.copy(src, dst)
-    if dst.stat().st_size > MAX_BYTES:
-        dst.unlink()
+    if src.stat().st_size > MAX_BYTES:
         return split_file(src, OUT)
+    dst = unique(OUT / src.name)
+    if WORK in src.parents:   # move instead of copy: no double disk use
+        shutil.move(src, dst)
+    else:
+        shutil.copy(src, dst)
     return [dst]
 
 
@@ -225,11 +274,14 @@ def compress_video(src: Path):
     def encode(rate, height, target=None):
         target = target or dst
         vf = f"scale=-2:'min({height},trunc(ih/2)*2)'"
+        # long videos get a faster preset so a job never runs out of time
         if CODEC == "h265":
-            codec = ["-c:v", "libx265", "-preset", "fast", "-tag:v", "hvc1",
+            preset = "fast" if dur <= 1800 else "veryfast" if dur <= 7200 else "ultrafast"
+            codec = ["-c:v", "libx265", "-preset", preset, "-tag:v", "hvc1",
                      "-x265-params", "log-level=error"]
         else:
-            codec = ["-c:v", "libx264", "-preset", "medium", "-profile:v", "high"]
+            preset = "medium" if dur <= 1800 else "veryfast" if dur <= 7200 else "superfast"
+            codec = ["-c:v", "libx264", "-preset", preset, "-profile:v", "high"]
         return ff(["-i", src, "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf,
                    *codec, *rate, "-pix_fmt", "yuv420p",
                    "-c:a", "aac", "-b:a", "96k", "-ac", "2",
@@ -365,10 +417,20 @@ def main():
         log("!!! nothing downloaded")
         sys.exit(1)
 
-    results, images, orig_total = [], [], 0
+    results, images, orig_total, seen = [], [], 0, set()
     for p in files:
         k = kind(p)
         orig = p.stat().st_size
+        if k == "junk":
+            log(f"-- skip  {p.name} (error page, not media)")
+            p.unlink(missing_ok=True)
+            continue
+        fp = fingerprint(p)
+        if fp in seen:
+            log(f"-- skip  {p.name} (duplicate)")
+            p.unlink(missing_ok=True)
+            continue
+        seen.add(fp)
         orig_total += orig
         log(f"-- {k:5} {p.name} ({mb(orig)})")
         try:
@@ -382,13 +444,15 @@ def main():
                     outs = keep_as_is(img)
                 else:
                     images.append(img)
+                    p.unlink(missing_ok=True)
                     continue
             else:
                 outs = keep_as_is(p)
         except Exception as e:  # never lose a file because of a bug
             log(f"   !! {e.__class__.__name__}: {e} -> keeping original")
-            outs = keep_as_is(p)
+            outs = keep_as_is(p) if p.exists() else []
         results += outs
+        p.unlink(missing_ok=True)   # free disk before the next file
 
     if images:
         big = [p for p in images if p.stat().st_size > MAX_BYTES]

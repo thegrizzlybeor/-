@@ -183,14 +183,10 @@ def main():
         print(f"::warning::{len(include)} jobs, GitHub allows {MAX_JOBS}; using the first {MAX_JOBS}")
         include = include[:MAX_JOBS]
 
-    if os.getenv("CREATE_RELEASES") == "1":
-        repo, sha = os.environ["GITHUB_REPOSITORY"], os.getenv("GITHUB_SHA", "")
-        for tag, rel_title in tags.items():
-            cmd = ["gh", "release", "create", tag, "--repo", repo, "--title", rel_title,
-                   "--notes", f"Files from workflow run {RUN}"]
-            if sha:
-                cmd += ["--target", sha]
-            subprocess.run(cmd, capture_output=True, text=True)
+    # Releases are NOT created here any more: each fetch job creates its release
+    # only after it has real files to upload. Pass the title along instead.
+    for e in include:
+        e["title"] = tags.get(e["tag"], e["tag"])
 
     summary = ["## Plan", "| # | Release | Link | Files | Size | Jobs |", "|---|---|---|---|---|---|"]
     summary += [f"| {i} | {t.replace('|', chr(92) + '|')} | {u} | {n} | {s} | {j} |" for i, t, u, n, s, j in rows]

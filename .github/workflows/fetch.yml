@@ -1,0 +1,211 @@
+name: Fetch & Compress
+
+on:
+  workflow_dispatch:
+    inputs:
+      links:
+        description: "Links, space or comma separated. Leave EMPTY to use links.txt"
+        required: false
+        default: ""
+      max_height:
+        description: "Max video height (videos are never upscaled)"
+        type: choice
+        options: ["480", "720", "1080"]
+        default: "720"
+      video_codec:
+        description: "h265 = smaller files, h264 = plays on everything"
+        type: choice
+        options: ["h265", "h264"]
+        default: "h265"
+      storage:
+        description: "release = files up to ~1.9 GB each, repo never grows. data-branch = files <=90 MB, in git."
+        type: choice
+        options: ["release", "data-branch"]
+        default: "release"
+      append:
+        description: "Keep previous batches (old releases / data-branch history). Off = replace them."
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      count: ${{ steps.m.outputs.count }}
+      tag: ${{ steps.rel.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: rel
+        if: inputs.storage != 'data-branch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPEND: ${{ inputs.append }}
+        run: |
+          set -euo pipefail
+          TAG="run-${GITHUB_RUN_NUMBER}"
+          if [ "$APPEND" != "true" ]; then
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName -q '.[].tagName' \
+              | { grep '^run-' || true; } \
+              | xargs -r -n1 gh release delete --repo "$GITHUB_REPOSITORY" --cleanup-tag -y
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Batch $TAG" --notes "Files from workflow run ${GITHUB_RUN_NUMBER}" || true
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - id: m
+        env:
+          INPUT_LINKS: ${{ inputs.links }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          raw = os.environ.get("INPUT_LINKS", "").strip()
+          if not raw:
+              lines = []
+              for line in open("links.txt", encoding="utf-8"):
+                  line = line.split(" #")[0].strip()
+                  if line and not line.startswith("#"):
+                      lines.append(line)
+              raw = "\n".join(lines)
+          links = []
+          for tok in re.split(r"\s+", raw):
+              for u in re.split(r",(?=https?://)", tok):
+                  u = u.strip().strip(",")
+                  if u and u not in links:
+                      links.append(u)
+          if len(links) > 256:
+              print("::warning::GitHub allows 256 matrix jobs, using the first 256")
+              links = links[:256]
+          matrix = {"include": [{"idx": i, "url": u} for i, u in enumerate(links, 1)]}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={json.dumps(matrix)}\n")
+              f.write(f"count={len(links)}\n")
+          print(f"{len(links)} link(s) queued")
+          PY
+
+  fetch:
+    needs: prepare
+    if: needs.prepare.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          pip install -q -U gallery-dl pillow pillow-heif
+
+      - name: Download + compress
+        env:
+          URL: ${{ matrix.url }}
+          IDX: ${{ matrix.idx }}
+          MAX_HEIGHT: ${{ inputs.max_height }}
+          VIDEO_CODEC: ${{ inputs.video_codec }}
+          MAX_MB: ${{ inputs.storage == 'data-branch' && '90' || '1900' }}
+          COOKIES: ${{ secrets.COOKIES }}
+        run: python scripts/fetch.py "$URL" "$IDX"
+
+      - name: Upload to release (up to 2 GB per file)
+        if: always() && inputs.storage != 'data-branch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -uo pipefail
+          [ -d out ] || exit 0
+          mkdir -p upload
+          for d in out/*/; do
+            n="$(basename "$d")"
+            for f in "$d"*; do
+              [ -f "$f" ] || continue
+              cp "$f" "upload/${n}__$(basename "$f")"
+            done
+          done
+          ls upload/* >/dev/null 2>&1 || exit 0
+          for try in 1 2 3; do
+            gh release upload "$TAG" upload/* --repo "$GITHUB_REPOSITORY" --clobber && break
+            echo "upload failed, retry $try"; sleep 15
+          done
+          {
+            echo "### Files"
+            echo "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.storage == 'data-branch'
+        with:
+          name: out-${{ matrix.idx }}
+          path: out
+          retention-days: 3
+          if-no-files-found: ignore
+
+  publish:
+    needs: [prepare, fetch]
+    if: always() && inputs.storage == 'data-branch' && needs.prepare.result == 'success' && needs.prepare.outputs.count != '0'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: publish-data
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: staged
+          pattern: out-*
+          merge-multiple: true
+
+      - name: Commit to the data branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPEND: ${{ inputs.append }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(ls -A staged 2>/dev/null)" ]; then
+            echo "Nothing to publish."; exit 0
+          fi
+          STAMP="$(date -u +%Y-%m-%d_%H%M)-run${GITHUB_RUN_NUMBER}"
+
+          git init -q pub && cd pub
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 524288000
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          if [ "$APPEND" = "true" ] && git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git fetch -q --depth=1 origin data
+            git checkout -q -B data FETCH_HEAD
+          else
+            git checkout -q -b data
+          fi
+
+          mkdir -p "data/$STAMP"
+          cp -r ../staged/. "data/$STAMP/"
+          git add -A
+          git commit -q -m "Batch $STAMP"
+
+          if [ "$APPEND" = "true" ]; then
+            git push -q origin data
+          else
+            git push -q --force origin data
+          fi
+
+          {
+            echo "## Done"
+            echo "Files are on the **data** branch: https://github.com/${GITHUB_REPOSITORY}/tree/data/data/${STAMP}"
+            echo
+            echo '```'
+            (cd "data/$STAMP" && find . -type f ! -name '_report.json' -exec du -h {} + | sort -k2)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -115,6 +115,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ matrix.tag }}
+          TITLE: ${{ matrix.title }}
         run: |
           set -uo pipefail
           [ -d out ] || exit 0
@@ -126,7 +127,11 @@ jobs:
               cp "$f" "upload/${n}__$(basename "$f")"
             done
           done
+          rm -f upload/*FAILED.txt upload/*_report.json
           ls upload/* >/dev/null 2>&1 || exit 0
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" --notes "" --target "$GITHUB_SHA" || true
           for try in 1 2 3; do
             gh release upload "$TAG" upload/* --repo "$GITHUB_REPOSITORY" --clobber && break
             echo "upload failed, retry $try"; sleep 15
